@@ -38,8 +38,9 @@ use filter::SubscriptionRule;
 use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
-    AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
-    PromptResult, PromptSource, SessionState, TimeoutKind,
+    failure_batch_disposition, AgentPool, ControlSignal, FailureBatchDisposition, IdleSwitchResult,
+    OwnedAgent, PromptContext, PromptOutcome, PromptResult, PromptSource, SessionRestoreFailure,
+    SessionState, TimeoutKind, SESSION_RESTORE_INDETERMINATE_NOTICE,
 };
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
@@ -3078,7 +3079,23 @@ fn handle_prompt_result(
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if matches!(
+            if failure_batch_disposition(&result.outcome)
+                == FailureBatchDisposition::BestEffortNoticeAndDrop
+            {
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "session restore blocked — attempting best-effort notice and dropping batch without retry"
+                );
+                // One detached publication attempt for this blocked result. The
+                // batch is dropped regardless of success; this is neither
+                // guaranteed delivery nor an exactly-once incident outbox.
+                spawn_failure_notice(
+                    rest_client,
+                    &batch,
+                    SESSION_RESTORE_INDETERMINATE_NOTICE.to_string(),
+                );
+            } else if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
@@ -3192,6 +3209,7 @@ fn handle_prompt_result(
     let outcome_label = match &result.outcome {
         PromptOutcome::Ok(_) => "ok",
         PromptOutcome::Error(_) => "error",
+        PromptOutcome::SessionRestoreIndeterminate(_) => "session_restore_indeterminate",
         PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
         PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
         PromptOutcome::AgentExited => "exited",
@@ -3353,13 +3371,28 @@ fn handle_prompt_result(
             );
             pool.return_agent(result.agent);
         }
-        PromptOutcome::Error(ref e) => {
+        PromptOutcome::SessionRestoreIndeterminate(SessionRestoreFailure::Quarantined)
+        | PromptOutcome::SessionRestoreIndeterminate(SessionRestoreFailure::Unavailable) => {
+            tracing::warn!(
+                agent = agent_index,
+                outcome = outcome_label,
+                configured_model = %harness_configured_model,
+                pid = harness_pid,
+                "agent_returned (session restore remains safely blocked)"
+            );
+            emit_turn_error(SESSION_RESTORE_INDETERMINATE_NOTICE, None);
+            pool.return_agent(result.agent);
+        }
+        PromptOutcome::Error(ref e)
+        | PromptOutcome::SessionRestoreIndeterminate(SessionRestoreFailure::Load(ref e))
+        | PromptOutcome::SessionRestoreIndeterminate(SessionRestoreFailure::Create(ref e)) => {
             let is_transport_error = matches!(
                 e,
                 acp::AcpError::Io(_)
                     | acp::AcpError::WriteTimeout(_)
                     | acp::AcpError::Timeout(_)
                     | acp::AcpError::Protocol(_)
+                    | acp::AcpError::AgentExited
             );
             let error_code = match &e {
                 acp::AcpError::AgentError { code, .. } => Some(*code),
