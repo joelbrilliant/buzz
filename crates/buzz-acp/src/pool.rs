@@ -39,6 +39,7 @@ use crate::queue::{
     PromptProfile, PromptProfileLookup, ThreadTags,
 };
 use crate::relay::{ChannelInfo, RestClient};
+use crate::session_store::RestoreClaim;
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
@@ -403,11 +404,30 @@ pub enum TimeoutKind {
     Hard { recently_active: bool },
 }
 
+/// Why a durable session restore is blocked.
+pub enum SessionRestoreFailure {
+    /// A `session/load` request was attempted, but its outcome is ambiguous.
+    Load(AcpError),
+    /// A write-ahead-protected `session/new` request failed after creation
+    /// intent was committed, so replacement creation is unsafe.
+    Create(AcpError),
+    /// An earlier ambiguous attempt is already durably quarantined. No wire
+    /// request was sent for this turn.
+    Quarantined,
+    /// Buzz could not safely read, reserve, or commit the durable binding. No
+    /// stateful ACP wire request was sent for this turn.
+    Unavailable,
+}
+
 /// Outcome of a prompt task.
 #[allow(dead_code)]
 pub enum PromptOutcome {
     Ok(StopReason),
     Error(AcpError),
+    /// A durable `session/load` may have succeeded remotely, but Buzz could not
+    /// prove the outcome. The stored binding is retained and the prompt is
+    /// blocked rather than retried or redirected into a new session.
+    SessionRestoreIndeterminate(SessionRestoreFailure),
     AgentExited,
     Timeout(TimeoutKind),
     /// Intentional cancel via `!cancel` command or interrupt mode.
@@ -423,6 +443,27 @@ pub enum PromptOutcome {
     /// `CancelReason` on the batch (steer/interrupt requeue, explicit cancel
     /// drops) rather than the hard-cap's unconditional dead-letter.
     CancelDrainTimeout(Duration),
+}
+
+pub(crate) const SESSION_RESTORE_INDETERMINATE_NOTICE: &str =
+    "⚠️ Durable ACP session resolution is safety-blocked. Buzz dropped this request and will not retry `session/load` or `session/new`, deliver the prompt, or create another session. A stateful ACP request may have reached the provider. Ask an operator to stop every Buzz ACP process using this store, locate the sidecar via `BUZZ_ACP_SESSION_STORE` (or its default location), and reconcile this channel's binding and restore guard before restarting. Restart alone does not clear the durable block.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureBatchDisposition {
+    RetryNormally,
+    BestEffortNoticeAndDrop,
+}
+
+/// Decide whether a failed prompt batch follows the ordinary retry policy or
+/// is dropped after one best-effort notice attempt for that blocked result. An
+/// indeterminate restore must never be requeued: retrying could issue another stateful load or fall through
+/// to creation before the stored binding has been reconciled.
+pub(crate) fn failure_batch_disposition(outcome: &PromptOutcome) -> FailureBatchDisposition {
+    if matches!(outcome, PromptOutcome::SessionRestoreIndeterminate(_)) {
+        FailureBatchDisposition::BestEffortNoticeAndDrop
+    } else {
+        FailureBatchDisposition::RetryNormally
+    }
 }
 
 /// Immutable config subset shared (via `Arc`) by all spawned prompt tasks.
@@ -803,30 +844,90 @@ const CONTROL_CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// Timeout for permission-mode requests (`session/set_config_option` with `configId: "mode"`).
 const PERMISSION_MODE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Result of resolving a durable channel binding before the first prompt.
+///
+/// `Indeterminate` is intentionally distinct from `NoBinding`: collapsing the
+/// two would let the caller fall through to `session/new` after a load may have
+/// succeeded remotely, forking hidden provider state.
+enum SessionResolution {
+    NoBinding,
+    Loaded(String),
+    Indeterminate(SessionRestoreFailure),
+}
+
+/// No current ACP error variant is a narrow, protocol-defined proof that a
+/// stored session no longer exists. `AgentError` also carries authentication,
+/// parameter, and other application failures, so every failed load is
+/// indeterminate until ACP defines a specific not-found contract.
+fn session_resolution_after_load_failure(error: AcpError) -> SessionResolution {
+    SessionResolution::Indeterminate(SessionRestoreFailure::Load(error))
+}
+
 /// Try to restore a durable channel session via `session/load`.
 ///
-/// Returns `Some(session_id)` on success. On miss, capability absence, or load
-/// failure, clears the stale binding (when present) and returns `None` so the
-/// caller can fall through to `session/new`.
+/// Only an authoritative missing binding permits `session/new`. A present
+/// binding with no load capability is blocked rather than silently replaced.
+/// Success returns the loaded session. Any load failure is indeterminate and
+/// must block creation, retry, deletion, overwrite, and prompt publication.
 async fn try_load_persisted_session(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
     channel_id: &Uuid,
     _agent_core: Option<&str>,
     _agent_canvas: Option<&str>,
-) -> Option<String> {
+) -> SessionResolution {
+    let stored = match ctx.session_store.claim_restore(
+        &ctx.agent_command,
+        &ctx.agent_args,
+        channel_id,
+    ) {
+        RestoreClaim::NoBinding => return SessionResolution::NoBinding,
+        RestoreClaim::Claimed(session_id) => session_id,
+        RestoreClaim::Indeterminate(session_id) => {
+            tracing::warn!(
+                target: "pool::session",
+                session_id = %session_id,
+                channel_id = %channel_id,
+                "session binding is quarantined after an earlier indeterminate load — blocking without retry"
+            );
+            return SessionResolution::Indeterminate(SessionRestoreFailure::Quarantined);
+        }
+        RestoreClaim::Unavailable => {
+            tracing::warn!(
+                target: "pool::session",
+                channel_id = %channel_id,
+                "session binding could not be reserved safely — blocking without a wire request"
+            );
+            return SessionResolution::Indeterminate(SessionRestoreFailure::Unavailable);
+        }
+    };
     if !agent.supports_load_session {
-        return None;
+        tracing::warn!(
+            target: "pool::session",
+            session_id = %stored,
+            channel_id = %channel_id,
+            "stored binding exists but agent does not support session/load — blocking replacement session creation"
+        );
+        return SessionResolution::Indeterminate(SessionRestoreFailure::Unavailable);
     }
-    let stored = ctx
-        .session_store
-        .get(&ctx.agent_command, &ctx.agent_args, channel_id)?;
     match agent
         .acp
         .session_load_full(&ctx.cwd, &stored, ctx.mcp_servers.clone())
         .await
     {
         Ok(resp) => {
+            if resp.session_id != stored {
+                tracing::warn!(
+                    target: "pool::session",
+                    expected_session_id = %stored,
+                    returned_session_id = %resp.session_id,
+                    channel_id = %channel_id,
+                    "session/load returned a different session id — leaving restore guard in place and blocking publication"
+                );
+                ctx.session_store
+                    .block_channel(&ctx.agent_command, &ctx.agent_args, channel_id);
+                return SessionResolution::Indeterminate(SessionRestoreFailure::Unavailable);
+            }
             if agent.model_capabilities.is_none() {
                 agent.model_capabilities = Some(AgentModelCapabilities {
                     config_options_raw: extract_model_config_options(&resp.raw),
@@ -842,8 +943,14 @@ async fn try_load_persisted_session(
                         tracing::warn!(
                             target: "pool::session",
                             error = %e,
-                            "model re-apply after session/load failed — continuing with loaded session"
+                            "model re-apply after session/load failed — leaving restore guard in place"
                         );
+                        ctx.session_store.block_channel(
+                            &ctx.agent_command,
+                            &ctx.agent_args,
+                            channel_id,
+                        );
+                        return SessionResolution::Indeterminate(SessionRestoreFailure::Load(e));
                     }
                 }
             }
@@ -857,57 +964,43 @@ async fn try_load_persisted_session(
                     tracing::warn!(
                         target: "pool::session",
                         error = %e,
-                        "permission mode after session/load failed — continuing"
+                        "permission mode after session/load failed — leaving restore guard in place"
                     );
+                    ctx.session_store.block_channel(
+                        &ctx.agent_command,
+                        &ctx.agent_args,
+                        channel_id,
+                    );
+                    return SessionResolution::Indeterminate(SessionRestoreFailure::Load(e));
                 }
             }
-            Some(resp.session_id)
-        }
-        Err(e) if load_failure_is_definitive(&e) => {
-            tracing::warn!(
-                target: "pool::session",
-                session_id = %stored,
-                channel_id = %channel_id,
-                error = %e,
-                "session/load rejected by agent — clearing stale binding (if unchanged) and creating a new session"
-            );
-            // Only drop the binding we failed to load. A concurrent process may
-            // already have written a newer session for this channel.
-            let _ = ctx.session_store.remove_if_equals(
+            if !ctx.session_store.confirm_restore(
                 &ctx.agent_command,
                 &ctx.agent_args,
                 channel_id,
                 &stored,
-            );
-            None
+            ) {
+                tracing::warn!(
+                    target: "pool::session",
+                    session_id = %stored,
+                    channel_id = %channel_id,
+                    "session/load succeeded but durable restore commit could not be confirmed — blocking prompt publication"
+                );
+                return SessionResolution::Indeterminate(SessionRestoreFailure::Unavailable);
+            }
+            SessionResolution::Loaded(resp.session_id)
         }
-        Err(e) => {
+        Err(error) => {
             tracing::warn!(
                 target: "pool::session",
                 session_id = %stored,
                 channel_id = %channel_id,
-                error = %e,
-                "session/load outcome indeterminate — keeping binding and creating a new session; \
-                 the stored session may still be live on the provider"
+                error = %error,
+                "session/load outcome indeterminate — write-ahead quarantine remains and new session creation is blocked"
             );
-            None
+            session_resolution_after_load_failure(error)
         }
     }
-}
-
-/// Whether a failed `session/load` proves the stored binding is dead.
-///
-/// Only a JSON-RPC error response is definitive: the provider answered and
-/// refused, so the session is genuinely gone and the binding is safe to drop.
-///
-/// Everything else is indeterminate. A timeout, transport failure or malformed
-/// response does NOT prove the provider failed to load — it may hold the session
-/// open. Dropping the binding on those and falling through to `session/new`
-/// would fork hidden provider state: two live sessions, one unreachable. Keeping
-/// the mapping is self-healing, because a provider that has genuinely lost the
-/// session answers `AgentError` on a later attempt and that clears it then.
-fn load_failure_is_definitive(error: &AcpError) -> bool {
-    matches!(error, AcpError::AgentError { .. })
 }
 
 /// Create a new ACP session via `session_new_full()`, populate model capabilities
@@ -916,12 +1009,26 @@ fn load_failure_is_definitive(error: &AcpError) -> bool {
 /// On error from `session_new_full()`, returns the `AcpError` — caller handles
 /// error reporting. Model-switch failures are logged and gracefully ignored
 /// (the agent proceeds with its default model).
+struct CreatedSession {
+    session_id: String,
+    observer_frames: Vec<(&'static str, serde_json::Value)>,
+}
+
+impl CreatedSession {
+    fn publish_observer_frames(self, acp: &mut AcpClient) -> String {
+        for (kind, payload) in self.observer_frames {
+            acp.observe(kind, payload);
+        }
+        self.session_id
+    }
+}
+
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
     agent_core: Option<&str>,
     agent_canvas: Option<&str>,
-) -> Result<String, AcpError> {
+) -> Result<CreatedSession, AcpError> {
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
@@ -982,6 +1089,9 @@ async fn create_session_and_apply_model(
     }
 
     // Apply desired_model if set, matching against the fresh session/new response.
+    // Observer frames are accumulated and published only after the caller's
+    // durable channel-binding commit succeeds.
+    let mut observer_frames = Vec::new();
     // Track whether the switch succeeded so session_config_captured reflects
     // the post-switch state (not the pre-switch desired state).
     let switch_succeeded = if let Some(ref desired) = agent.desired_model {
@@ -999,14 +1109,14 @@ async fn create_session_and_apply_model(
                 // pick rather than silently no-op. On the busy path the turn has
                 // already been cancelled+requeued by the time we get here, so the
                 // turn restarts on the unchanged model and the user is told no.
-                agent.acp.observe(
+                observer_frames.push((
                     "control_result",
                     serde_json::json!({
                         "type": "switch_model",
                         "status": "unsupported_model",
                         "modelId": desired,
                     }),
-                );
+                ));
                 false
             }
         }
@@ -1019,7 +1129,7 @@ async fn create_session_and_apply_model(
     // post-switch state. modelOverridden reflects whether the switch actually
     // applied — false on the unsupported arm so the panel doesn't show a
     // stale override badge.
-    agent.acp.observe(
+    observer_frames.push((
         "session_config_captured",
         serde_json::json!({
             "configOptions": resp.raw.get("configOptions").cloned().unwrap_or(serde_json::Value::Null),
@@ -1030,7 +1140,7 @@ async fn create_session_and_apply_model(
             // keyed by (agent, relay) like the lifecycle frames.
             "relayUrl": ctx.relay_url,
         }),
-    );
+    ));
 
     // Apply permission mode if not the agent's built-in default AND the agent
     // advertises the requested mode in session/new. Agents that don't support
@@ -1042,7 +1152,10 @@ async fn create_session_and_apply_model(
         apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
     }
 
-    Ok(resp.session_id)
+    Ok(CreatedSession {
+        session_id: resp.session_id,
+        observer_frames,
+    })
 }
 
 /// Send the appropriate ACP model-switch request with a timeout.
@@ -1087,25 +1200,14 @@ async fn apply_model_switch(
                 "applied model {desired} via {method_label} on session {session_id}"
             );
         }
-        // Transport-class errors may have corrupted the stdio stream — propagate
-        // so the caller can respawn the agent instead of reusing a poisoned one.
-        Ok(Err(e @ AcpError::Io(_)))
-        | Ok(Err(e @ AcpError::WriteTimeout(_)))
-        | Ok(Err(e @ AcpError::Timeout(_)))
-        | Ok(Err(e @ AcpError::Protocol(_)))
-        | Ok(Err(e @ AcpError::AgentExited)) => {
+        // Any rejected or malformed config subrequest leaves the requested
+        // fresh/restored session transaction unauthorized for publication.
+        Ok(Err(e)) => {
             tracing::error!(
                 target: "pool::model",
-                "fatal error setting model {desired} via {method_label}: {e}"
+                "failed to authorize model {desired} via {method_label}: {e}"
             );
             return Err(e);
-        }
-        // Application-level errors (Json, etc.) — agent is fine, just uses default model.
-        Ok(Err(e)) => {
-            tracing::warn!(
-                target: "pool::model",
-                "failed to set model {desired} via {method_label}: {e} — proceeding with agent default"
-            );
         }
         Err(_) => {
             // Outer timeout fired — the inner send_request may have left the
@@ -1120,10 +1222,6 @@ async fn apply_model_switch(
     Ok(())
 }
 
-/// Set the session permission mode via `session/set_config_option`.
-///
-/// Non-fatal for most errors: logs and proceeds. The agent falls back
-/// to its default permission mode (`"default"`), which still works via
 /// Check if the agent's `session/new` response advertises a given mode ID
 /// in `result.modes.availableModes[].id`. Returns `false` if the modes
 /// field is absent or the mode isn't listed.
@@ -1140,10 +1238,10 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
         .unwrap_or(false)
 }
 
-/// per-tool auto-approval in `handle_permission_request`.
+/// Set the session permission mode via `session/set_config_option`.
 ///
-/// **Fatal exception:** if the agent process exits (e.g., goose crashes on
-/// unrecognized methods), returns `Err(AgentExited)` so the caller can respawn.
+/// The requested mode is part of session authorization. Any ACP error is
+/// returned so callers can keep durable session resolution blocked.
 async fn apply_permission_mode(
     acp: &mut AcpClient,
     session_id: &str,
@@ -1163,25 +1261,14 @@ async fn apply_permission_mode(
                 "applied permission mode {wire:?} on session {session_id}"
             );
         }
-        // Transport-class errors may have corrupted the stdio stream — propagate
-        // so the caller can respawn the agent.
-        Ok(Err(e @ AcpError::Io(_)))
-        | Ok(Err(e @ AcpError::WriteTimeout(_)))
-        | Ok(Err(e @ AcpError::Timeout(_)))
-        | Ok(Err(e @ AcpError::Protocol(_)))
-        | Ok(Err(e @ AcpError::AgentExited)) => {
+        // Permission configuration is part of session authorization. Any ACP
+        // error blocks publication rather than silently changing the policy.
+        Ok(Err(e)) => {
             tracing::error!(
                 target: "pool::permission",
-                "fatal error setting permission mode {wire:?}: {e}"
+                "failed to authorize permission mode {wire:?}: {e}"
             );
             return Err(e);
-        }
-        // Application-level errors — agent is fine, just uses default permission mode.
-        Ok(Err(e)) => {
-            tracing::warn!(
-                target: "pool::permission",
-                "failed to set permission mode {wire:?}: {e} — falling back to per-tool auto-approval"
-            );
         }
         Err(_) => {
             // Outer timeout fired — stream may be in unknown state.
@@ -1582,74 +1669,135 @@ pub async fn run_prompt_task(
 
     let (session_id, is_new_session) = match &source {
         PromptSource::Channel(cid) => {
-            if let Some(sid) = agent.state.sessions.get(cid) {
-                (sid.clone(), false)
-            } else if let Some(sid) = try_load_persisted_session(
-                &mut agent,
-                &ctx,
-                cid,
-                agent_core.as_deref(),
-                agent_canvas.as_deref(),
-            )
-            .await
-            {
-                tracing::info!(
-                    target: "pool::session",
-                    "loaded session {sid} for channel {cid}"
-                );
-                agent.state.sessions.insert(*cid, sid.clone());
-                if let Some((pending_cid, section)) = pending_canvas.take() {
-                    agent.state.canvas_sections.insert(pending_cid, section);
+            if let Some(sid) = agent.state.sessions.get(cid).cloned() {
+                if !ctx.session_store.retains_channel_lease(
+                    &ctx.agent_command,
+                    &ctx.agent_args,
+                    cid,
+                ) {
+                    tracing::warn!(
+                        target: "pool::session",
+                        channel_id = %cid,
+                        "in-memory session has no retained durable binding lease — blocking prompt publication"
+                    );
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::SessionRestoreIndeterminate(
+                            SessionRestoreFailure::Unavailable,
+                        ),
+                        batch,
+                    );
+                    return;
                 }
                 (sid, false)
             } else {
-                // Create new session with model application.
-                match create_session_and_apply_model(
+                match try_load_persisted_session(
                     &mut agent,
                     &ctx,
+                    cid,
                     agent_core.as_deref(),
                     agent_canvas.as_deref(),
                 )
                 .await
                 {
-                    Ok(sid) => {
+                    SessionResolution::Loaded(sid) => {
                         tracing::info!(
                             target: "pool::session",
-                            "created session {sid} for channel {cid}"
+                            "loaded session {sid} for channel {cid}"
                         );
                         agent.state.sessions.insert(*cid, sid.clone());
-                        ctx.session_store
-                            .put(&ctx.agent_command, &ctx.agent_args, cid, &sid);
-                        // Commit canvas only after session creation succeeds (I3).
                         if let Some((pending_cid, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_cid, section);
                         }
-                        (sid, true)
+                        (sid, false)
                     }
-                    Err(AcpError::AgentExited) => {
-                        agent.state.invalidate_all();
+                    SessionResolution::Indeterminate(error) => {
                         send_prompt_result(
                             &result_tx,
                             &turn_id,
                             agent,
                             source,
-                            PromptOutcome::AgentExited,
-                            requeue_batch_if_queue(&ctx, batch),
+                            PromptOutcome::SessionRestoreIndeterminate(error),
+                            batch,
                         );
                         return;
                     }
-                    Err(e) => {
-                        // Session creation failed; pending canvas was never committed,
-                        // so the next retry will re-fetch a fresh revision.
-                        send_prompt_result(
-                            &result_tx,
-                            &turn_id,
-                            agent,
-                            source,
-                            PromptOutcome::Error(e),
-                            requeue_batch_if_queue(&ctx, batch),
-                        );
-                        return;
+                    SessionResolution::NoBinding => {
+                        // Create new session with model application.
+                        match create_session_and_apply_model(
+                            &mut agent,
+                            &ctx,
+                            agent_core.as_deref(),
+                            agent_canvas.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(created) => {
+                                let sid = &created.session_id;
+                                tracing::info!(
+                                    target: "pool::session",
+                                    "created session {sid} for channel {cid}"
+                                );
+                                if !ctx.session_store.commit_new_binding(
+                                    &ctx.agent_command,
+                                    &ctx.agent_args,
+                                    cid,
+                                    sid,
+                                ) {
+                                    send_prompt_result(
+                                        &result_tx,
+                                        &turn_id,
+                                        agent,
+                                        source,
+                                        PromptOutcome::SessionRestoreIndeterminate(
+                                            SessionRestoreFailure::Unavailable,
+                                        ),
+                                        batch,
+                                    );
+                                    return;
+                                }
+                                let sid = created.publish_observer_frames(&mut agent.acp);
+                                agent.state.sessions.insert(*cid, sid.clone());
+                                // Commit canvas only after session creation succeeds (I3).
+                                if let Some((pending_cid, section)) = pending_canvas.take() {
+                                    agent.state.canvas_sections.insert(pending_cid, section);
+                                }
+                                (sid, true)
+                            }
+                            Err(AcpError::AgentExited) => {
+                                agent.state.invalidate_all();
+                                send_prompt_result(
+                                    &result_tx,
+                                    &turn_id,
+                                    agent,
+                                    source,
+                                    PromptOutcome::SessionRestoreIndeterminate(
+                                        SessionRestoreFailure::Create(AcpError::AgentExited),
+                                    ),
+                                    batch,
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                // Creation intent was durably committed before
+                                // session/new, so a failed response is blocked
+                                // rather than retried or replaced.
+                                send_prompt_result(
+                                    &result_tx,
+                                    &turn_id,
+                                    agent,
+                                    source,
+                                    PromptOutcome::SessionRestoreIndeterminate(
+                                        SessionRestoreFailure::Create(e),
+                                    ),
+                                    batch,
+                                );
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -1659,7 +1807,8 @@ pub async fn run_prompt_task(
                 (sid.clone(), false)
             } else {
                 match create_session_and_apply_model(&mut agent, &ctx, None, None).await {
-                    Ok(sid) => {
+                    Ok(created) => {
+                        let sid = created.publish_observer_frames(&mut agent.acp);
                         tracing::info!(
                             target: "pool::session",
                             "created heartbeat session {sid} for agent {}",
@@ -3784,22 +3933,21 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
-    /// A `session/load` failure only clears the durable binding when the
-    /// provider actually answered and refused. Timeouts, transport failures and
-    /// malformed responses are indeterminate: the provider may hold the session
-    /// open, and clearing the binding there would fork hidden state into two
-    /// live sessions with one unreachable.
+    /// No current ACP error variant proves that a stored session is gone.
+    /// In particular, `AgentError` also carries authentication and parameter
+    /// failures. Every failed `session/load` must therefore block fallback to
+    /// `session/new` rather than deleting or overwriting the durable binding.
     #[test]
-    fn only_an_agent_error_is_a_definitive_session_load_failure() {
+    fn every_session_load_failure_blocks_new_session_fallback() {
         use std::time::Duration;
 
-        assert!(super::load_failure_is_definitive(&AcpError::AgentError {
-            code: -32602,
-            message: "no such session".into(),
-        }));
-
-        for indeterminate in [
+        for error in [
+            AcpError::AgentError {
+                code: -32602,
+                message: "authentication required".into(),
+            },
             AcpError::Timeout(Duration::from_secs(1)),
             AcpError::IdleTimeout(Duration::from_secs(1)),
             AcpError::WriteTimeout(Duration::from_secs(1)),
@@ -3811,12 +3959,43 @@ mod tests {
             AcpError::Protocol("truncated frame".into()),
         ] {
             assert!(
-                !super::load_failure_is_definitive(&indeterminate),
-                "{indeterminate:?} must not clear the binding"
+                matches!(
+                    super::session_resolution_after_load_failure(error),
+                    SessionResolution::Indeterminate(_)
+                ),
+                "a failed load must be indeterminate until ACP defines a narrow not-found contract"
             );
         }
     }
-    use super::*;
+
+    /// The indeterminate path is deliberately visible and non-retryable: the
+    /// triggering batch is used for a best-effort actionable notice, then
+    /// dropped. Later blocked prompts may emit the notice again; this is not an
+    /// exactly-once delivery contract or a durable outbox.
+    #[test]
+    fn indeterminate_restore_requests_best_effort_notice_without_prompt_retry() {
+        let outcome = PromptOutcome::SessionRestoreIndeterminate(SessionRestoreFailure::Load(
+            AcpError::Protocol("load response was malformed".into()),
+        ));
+
+        assert_eq!(
+            failure_batch_disposition(&outcome),
+            FailureBatchDisposition::BestEffortNoticeAndDrop
+        );
+        assert_eq!(
+            SESSION_RESTORE_INDETERMINATE_NOTICE,
+            "⚠️ Durable ACP session resolution is safety-blocked. Buzz dropped this request and will not retry `session/load` or `session/new`, deliver the prompt, or create another session. A stateful ACP request may have reached the provider. Ask an operator to stop every Buzz ACP process using this store, locate the sidecar via `BUZZ_ACP_SESSION_STORE` (or its default location), and reconcile this channel's binding and restore guard before restarting. Restart alone does not clear the durable block."
+        );
+
+        let create_outcome = PromptOutcome::SessionRestoreIndeterminate(
+            SessionRestoreFailure::Create(AcpError::Protocol("new response was malformed".into())),
+        );
+        assert_eq!(
+            failure_batch_disposition(&create_outcome),
+            FailureBatchDisposition::BestEffortNoticeAndDrop
+        );
+    }
+
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
 
@@ -4677,6 +4856,7 @@ mod tests {
             PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "Timeout(Hard)",
             PromptOutcome::CancelDrainTimeout(_) => "CancelDrainTimeout",
             PromptOutcome::Error(_) => "Error",
+            PromptOutcome::SessionRestoreIndeterminate(_) => "SessionRestoreIndeterminate",
             PromptOutcome::Cancelled => "Cancelled",
             PromptOutcome::Ok(_) => "Ok",
         };
